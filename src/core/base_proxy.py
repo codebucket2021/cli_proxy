@@ -940,6 +940,39 @@ class BaseProxyService(ABC):
                     response_headers[k] = v
                     response_headers_for_log[k] = v
 
+            # 拦截上游返回 200 但 body 为空的异常情况
+            # 上游偶尔会返回 status=200 + content-length=0，客户端无法解析空 body 会报错
+            upstream_content_length = response.headers.get('content-length')
+            if status_code == 200 and upstream_content_length == '0':
+                if is_stream:
+                    await response.aclose()
+
+                duration_ms = int((time.time() - start_time) * 1000)
+                await self.realtime_hub.request_completed(
+                    request_id=request_id,
+                    status_code=502,
+                    duration_ms=duration_ms,
+                    success=False
+                )
+                await self.log_request(
+                    method=request.method,
+                    path=path,
+                    status_code=502,
+                    duration_ms=duration_ms,
+                    target_headers=target_headers,
+                    filtered_body=filtered_body,
+                    original_headers=original_headers,
+                    original_body=original_body,
+                    channel=active_config_name,
+                    target_url=target_url,
+                    response_headers=response_headers_for_log,
+                )
+                await asyncio.to_thread(self._record_lb_result, active_config_name, 502)
+                return JSONResponse(
+                    {"type": "error", "error": {"type": "api_error", "message": "上游返回空响应 (status=200, content-length=0)"}},
+                    status_code=502
+                )
+
             collected = bytearray()
             total_response_bytes = 0
             response_truncated = False
@@ -978,6 +1011,15 @@ class BaseProxyService(ABC):
                         else:
                             response_truncated = True
                         yield chunk
+                except Exception as stream_exc:
+                    # 流式传输中断（连接断开、解压错误等）
+                    # 注入 Anthropic 格式的 SSE error 事件，让客户端能正确识别错误
+                    if is_stream:
+                        error_data = json.dumps({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": f"流式响应中断: {stream_exc}"}
+                        })
+                        yield f"event: error\ndata: {error_data}\n\n".encode('utf-8')
                 finally:
                     final_duration = int((time.time() - start_time) * 1000)
 
