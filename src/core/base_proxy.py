@@ -88,8 +88,8 @@ class BaseProxyService(ABC):
         # {group_name: {'index': int, 'last_time': float}}
         self._rotation_state: Dict[str, Dict[str, Any]] = {}
 
-        # 触发自动禁用 key 的 HTTP 状态码
-        self.KEY_FATAL_STATUS_CODES = {401, 402, 403, 429}
+        # 触发自动禁用 key 的 HTTP 状态码 (429 是临时限流，不禁用)
+        self.KEY_FATAL_STATUS_CODES = {401, 402, 403}
 
         # 初始化实时事件中心
         self.realtime_hub = RealTimeRequestHub(service_name)
