@@ -1612,11 +1612,13 @@ const app = createApp({
                 let currentContent = configContents[service];
                 let currentActiveGroup = null;
                 let currentRotation = { idle_timeout: 300 };
+                let existingGroups = {};
                 try {
                     if (currentContent) {
                         const parsed = JSON.parse(currentContent);
                         currentActiveGroup = parsed.__active_group || null;
                         currentRotation = parsed.__rotation || { idle_timeout: 300 };
+                        existingGroups = parsed.__groups || {};
                     }
                 } catch (e) { /* ignore */ }
 
@@ -1641,7 +1643,11 @@ const app = createApp({
                         }
                         keys.push(keyObj);
                     });
+                    // 保留组中表单不认识的额外字段（如 fatal_status_codes）
+                    const existingGroup = existingGroups[gName] || {};
+                    const { base_url: _, auth_type: __, keys: ___, ...extraFields } = existingGroup;
                     groups[gName] = {
+                        ...extraFields,
                         base_url: group.baseUrl || '',
                         auth_type: group.authType || 'auth_token',
                         keys

@@ -88,8 +88,8 @@ class BaseProxyService(ABC):
         # {group_name: {'index': int, 'last_time': float}}
         self._rotation_state: Dict[str, Dict[str, Any]] = {}
 
-        # 触发自动禁用 key 的 HTTP 状态码 (429 是临时限流，不禁用)
-        self.KEY_FATAL_STATUS_CODES = {401, 402, 403}
+        # 默认不自动禁用任何 key；各组可通过 fatal_status_codes 字段自定义
+        self.DEFAULT_FATAL_STATUS_CODES: set = set()
 
         # 初始化实时事件中心
         self.realtime_hub = RealTimeRequestHub(service_name)
@@ -782,6 +782,17 @@ class BaseProxyService(ABC):
         if changed:
             self._persist_lb_config()
 
+    def _get_fatal_status_codes(self, group_name: Optional[str]) -> set:
+        """获取组配置的 fatal_status_codes，未配置则返回空集（不自动禁用）"""
+        if not group_name:
+            return self.DEFAULT_FATAL_STATUS_CODES
+        groups = self.config_manager.groups
+        group_data = groups.get(group_name, {})
+        codes = group_data.get('fatal_status_codes')
+        if codes is not None:
+            return set(codes)
+        return self.DEFAULT_FATAL_STATUS_CODES
+
     def _select_key_from_group(self, group_name: str, group_data: Dict[str, Any], exclude_keys: set = None) -> Optional[Dict[str, Any]]:
         """
         从组中选择一个 key，基于空闲超时轮转策略:
@@ -963,9 +974,12 @@ class BaseProxyService(ABC):
         )
 
         try:
-            # Key 错误感知重试: 遇到 401/402/403/429 时禁用当前 key 并尝试下一个
+            # Key 错误感知重试: 遇到组配置的 fatal_status_codes 时禁用当前 key 并尝试下一个
             excluded_keys: set = set()
             response = None
+
+            # 获取当前组的 fatal_status_codes（未配置则为空集，不触发自动禁用）
+            fatal_codes = self._get_fatal_status_codes(active_group_name)
 
             while True:
                 request_out = self.client.build_request(
@@ -977,7 +991,7 @@ class BaseProxyService(ABC):
                 response = await self.client.send(request_out, stream=is_stream)
                 status_code = response.status_code
 
-                if status_code not in self.KEY_FATAL_STATUS_CODES:
+                if not fatal_codes or status_code not in fatal_codes:
                     break  # 正常响应或非 key 级别的错误，不重试
 
                 # 读取错误响应体用于日志

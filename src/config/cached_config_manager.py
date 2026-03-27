@@ -14,6 +14,12 @@
         {"name": "key1", "auth_token": "sk-xxx", "disabled": false},
         {"name": "key2", "auth_token": "sk-yyy", "disabled": false}
       ]
+    },
+    "codexFree": {
+      "base_url": "https://example.com/v1",
+      "auth_type": "api_key",
+      "fatal_status_codes": [401, 402, 403, 429],
+      "keys": [...]
     }
   }
 }
