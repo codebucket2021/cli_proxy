@@ -977,9 +977,12 @@ class BaseProxyService(ABC):
             # Key 错误感知重试: 遇到组配置的 fatal_status_codes 时禁用当前 key 并尝试下一个
             excluded_keys: set = set()
             response = None
+            MAX_CONSECUTIVE_FAILURES = 3  # 连续同状态码失败上限，超过视为全局性错误
 
             # 获取当前组的 fatal_status_codes（未配置则为空集，不触发自动禁用）
             fatal_codes = self._get_fatal_status_codes(active_group_name)
+            consecutive_same_code = 0
+            last_fatal_code = None
 
             while True:
                 request_out = self.client.build_request(
@@ -1004,15 +1007,34 @@ class BaseProxyService(ABC):
                 else:
                     error_body = response.content
 
+                # 检测是否为非 key 级别的错误（如 HTML 响应 = Cloudflare/WAF 拦截）
+                error_text = ''
+                try:
+                    error_text = error_body.decode('utf-8', errors='ignore')[:200] if error_body else ''
+                except Exception:
+                    pass
+                is_non_key_error = error_text.lstrip().startswith('<')  # HTML 响应不是 API 错误
+
+                # 连续相同状态码计数
+                if status_code == last_fatal_code:
+                    consecutive_same_code += 1
+                else:
+                    consecutive_same_code = 1
+                    last_fatal_code = status_code
+
+                # 如果是非 key 级别错误，或连续失败超限，停止重试且不禁用 key
+                if is_non_key_error or consecutive_same_code >= MAX_CONSECUTIVE_FAILURES:
+                    if is_non_key_error:
+                        print(f"[KEY重试] 检测到非API错误(HTML响应)，停止重试，不禁用 key")
+                    else:
+                        print(f"[KEY重试] 连续 {consecutive_same_code} 个 key 返回 HTTP {status_code}，判定为全局性错误，停止重试")
+                    break
+
                 # 禁用当前 key
                 excluded_keys.add(active_config_name)
                 reason = f"HTTP {status_code}"
-                try:
-                    error_text = error_body.decode('utf-8', errors='ignore')[:200] if error_body else ''
-                    if error_text:
-                        reason = f"HTTP {status_code}: {error_text}"
-                except Exception:
-                    pass
+                if error_text:
+                    reason = f"HTTP {status_code}: {error_text}"
                 await asyncio.to_thread(
                     self.config_manager.disable_key, active_group_name, active_config_name, reason
                 )
