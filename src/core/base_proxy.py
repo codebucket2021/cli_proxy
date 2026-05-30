@@ -79,6 +79,7 @@ class BaseProxyService(ABC):
         self.lb_config_signature = self._get_file_signature(self.lb_config_file)
 
         # 初始化异步HTTP客户端
+        self._client_rebuild_lock = asyncio.Lock()
         self.client = self._create_async_client()
 
         # 响应日志截断阈值（避免长流占用过多内存）
@@ -139,6 +140,73 @@ class BaseProxyService(ABC):
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         return httpx.AsyncClient(timeout=timeout, limits=limits, headers={"Connection": "keep-alive"}, verify=ssl_context)
 
+    async def _close_retired_client_later(self, client: httpx.AsyncClient, delay_seconds: float = 60.0):
+        """延迟关闭旧连接池，避免打断正在读取的并发流式请求。"""
+        try:
+            await asyncio.sleep(delay_seconds)
+            await client.aclose()
+        except Exception as exc:
+            print(f"[上游连接池] 关闭旧连接池失败: {exc}")
+
+    async def _rebuild_async_client(self, reason: str):
+        """为后续请求切换到新的 httpx 连接池。"""
+        async with self._client_rebuild_lock:
+            old_client = self.client
+            self.client = self._create_async_client()
+            print(f"[上游连接池] 已重建连接池: {reason}")
+            asyncio.create_task(self._close_retired_client_later(old_client))
+
+    def _is_retryable_upstream_error(self, exc: Exception) -> bool:
+        return isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError))
+
+    async def _send_upstream_request(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        content: Optional[bytes],
+        is_stream: bool,
+        max_retries: int = 1,
+    ) -> Tuple[httpx.Response, list]:
+        """发送上游请求；仅在未向客户端写出任何数据前，对协议级断流做一次安全重试。"""
+        attempts = []
+        for attempt in range(max_retries + 1):
+            client = self.client
+            request_out = client.build_request(
+                method=method,
+                url=url,
+                headers=headers,
+                content=content if content else None,
+            )
+            try:
+                response = await client.send(request_out, stream=is_stream)
+                if attempts:
+                    attempts.append({
+                        "attempt": attempt + 1,
+                        "phase": "send",
+                        "result": "success",
+                    })
+                return response, attempts
+            except httpx.RequestError as exc:
+                retryable = self._is_retryable_upstream_error(exc)
+                attempt_info = {
+                    "attempt": attempt + 1,
+                    "phase": "send",
+                    "error_class": type(exc).__name__,
+                    "message": str(exc),
+                    "retryable": retryable and attempt < max_retries,
+                }
+                attempts.append(attempt_info)
+
+                if not retryable or attempt >= max_retries:
+                    setattr(exc, "_clp_upstream_attempts", attempts)
+                    raise
+
+                await self._rebuild_async_client(f"{type(exc).__name__}: {exc}")
+                await asyncio.sleep(0.25 * (attempt + 1))
+
+        raise RuntimeError("unreachable upstream retry state")
+
     def _setup_routes(self):
         """设置API路由"""
         @self.app.api_route(
@@ -185,6 +253,8 @@ class BaseProxyService(ABC):
         total_response_bytes: Optional[int] = None,
         target_url: Optional[str] = None,
         response_headers: Optional[Dict] = None,
+        upstream_error: Optional[Dict[str, Any]] = None,
+        upstream_attempts: Optional[list] = None,
     ):
         """记录请求日志到jsonl文件（异步调度）"""
 
@@ -229,6 +299,15 @@ class BaseProxyService(ABC):
 
                 if total_response_bytes is not None:
                     log_entry['response_bytes'] = total_response_bytes
+
+                if upstream_error:
+                    log_entry['upstream_error'] = upstream_error
+
+                if upstream_attempts:
+                    log_entry['upstream_attempts'] = upstream_attempts
+                    log_entry['upstream_retry_count'] = sum(
+                        1 for attempt in upstream_attempts if attempt.get('retryable')
+                    )
 
                 # 限制日志文件为最多100条记录
                 self._maintain_log_limit(log_entry)
@@ -622,33 +701,113 @@ class BaseProxyService(ABC):
             
         return body, None
 
+    # modality 优先级：图片 > 音频 > 文档（命中第一个即用）
+    _MODALITY_PRIORITY = ('image', 'audio', 'document')
+
+    def _detect_request_modality(self, body_json: dict) -> set:
+        """扫描请求体的消息内容，返回包含的非文本模态集合。
+
+        兼容三种主流请求体形态：
+        - Anthropic Messages API：顶层 `messages[]`，图片 block `type: image`
+        - OpenAI Responses API（Codex）：顶层 `input[]`，图片 block `type: input_image`
+        - OpenAI Chat Completions：顶层 `messages[]`，图片 block `type: image_url`
+
+        识别规则：
+        - image / input_image / image_url -> image
+        - document                        -> document
+        - input_audio / audio             -> audio
+        - tool_result 内嵌的 image 也计入  -> image
+        """
+        modalities = set()
+
+        # 收集所有可能的"消息容器"
+        containers = []
+        for key in ('messages', 'input'):
+            v = body_json.get(key)
+            if isinstance(v, list):
+                containers.append(v)
+
+        image_types = ('image', 'input_image', 'image_url')
+
+        for msgs in containers:
+            for msg in msgs:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get('content')
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get('type', '')
+                    if btype in image_types:
+                        modalities.add('image')
+                    elif btype == 'document':
+                        modalities.add('document')
+                    elif btype in ('input_audio', 'audio'):
+                        modalities.add('audio')
+                    elif btype == 'tool_result':
+                        inner = block.get('content')
+                        if isinstance(inner, list):
+                            for ib in inner:
+                                if isinstance(ib, dict) and ib.get('type') in image_types:
+                                    modalities.add('image')
+        return modalities
+
+    def _select_target_by_modality(self, default_target: str, modality_targets, request_modalities: set):
+        """按模态优先级选择 target，返回 (chosen_target, matched_modality_or_None)。
+
+        若 modality_targets 缺失/格式不合法/无命中，回退到 default_target。
+        """
+        if not isinstance(modality_targets, dict) or not request_modalities:
+            return default_target, None
+        for mod in self._MODALITY_PRIORITY:
+            if mod not in request_modalities:
+                continue
+            candidate = modality_targets.get(mod)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip(), mod
+        return default_target, None
+
     def _apply_model_mapping(self, body_json: dict, model: str, original_body: bytes) -> Tuple[bytes, Optional[str]]:
-        """应用模型→模型映射和配置→模型映射"""
+        """应用模型→模型映射和配置→模型映射，支持按模态选择目标模型。"""
         mappings = self.routing_config.get('modelMappings', {}).get(self.service_name, [])
+        request_modalities = self._detect_request_modality(body_json)
 
         for mapping in mappings:
             source = mapping.get('source', '').strip()
             target = mapping.get('target', '').strip()
             source_type = mapping.get('source_type', 'model').strip()
+            modality_targets = mapping.get('modalityTargets')
 
             if not source or not target:
                 continue
 
+            matched = False
             if source_type == 'config':
-                # 配置→模型映射
                 current_config = self._get_current_active_config()
                 if current_config == source:
-                    body_json['model'] = target
-                    modified_body = json.dumps(body_json, ensure_ascii=False).encode('utf-8')
-                    print(f"配置映射: {source} -> {target}")
-                    return modified_body, None
+                    matched = True
             elif source_type == 'model':
-                # 模型→模型映射
                 if model == source:
-                    body_json['model'] = target
-                    modified_body = json.dumps(body_json, ensure_ascii=False).encode('utf-8')
-                    print(f"模型映射: {source} -> {target}")
-                    return modified_body, None
+                    matched = True
+
+            if not matched:
+                continue
+
+            chosen_target, matched_modality = self._select_target_by_modality(
+                target, modality_targets, request_modalities
+            )
+
+            body_json['model'] = chosen_target
+            modified_body = json.dumps(body_json, ensure_ascii=False).encode('utf-8')
+
+            label = '配置映射' if source_type == 'config' else '模型映射'
+            if matched_modality:
+                print(f"{label}[{matched_modality}]: {source} -> {chosen_target}")
+            else:
+                print(f"{label}: {source} -> {chosen_target}")
+            return modified_body, None
 
         return original_body, None
 
@@ -972,6 +1131,7 @@ class BaseProxyService(ABC):
             'application/x-ndjson' in content_type or
             "stream" in x_stainless_helper_method
         )
+        upstream_attempts_log = []
 
         try:
             # Key 错误感知重试: 遇到组配置的 fatal_status_codes 时禁用当前 key 并尝试下一个
@@ -985,13 +1145,14 @@ class BaseProxyService(ABC):
             last_fatal_code = None
 
             while True:
-                request_out = self.client.build_request(
+                response, send_attempts = await self._send_upstream_request(
                     method=request.method,
                     url=target_url,
                     headers=target_headers,
-                    content=filtered_body if filtered_body else None,
+                    content=filtered_body,
+                    is_stream=is_stream,
                 )
-                response = await self.client.send(request_out, stream=is_stream)
+                upstream_attempts_log.extend(send_attempts)
                 status_code = response.status_code
 
                 if not fatal_codes or status_code not in fatal_codes:
@@ -1059,6 +1220,7 @@ class BaseProxyService(ABC):
                         filtered_body=filtered_body, original_headers=original_headers,
                         original_body=original_body, response_content=error_body,
                         channel=active_config_name, target_url=target_url,
+                        upstream_attempts=upstream_attempts_log,
                     )
                     return JSONResponse(
                         {"type": "error", "error": {"type": "api_error", "message": f"组内所有 key 均不可用 (最后错误: HTTP {status_code})"}},
@@ -1115,6 +1277,7 @@ class BaseProxyService(ABC):
                     channel=active_config_name,
                     target_url=target_url,
                     response_headers=response_headers_for_log,
+                    upstream_attempts=upstream_attempts_log,
                 )
                 await asyncio.to_thread(self._record_lb_result, active_config_name, 502)
                 return JSONResponse(
@@ -1126,59 +1289,121 @@ class BaseProxyService(ABC):
             total_response_bytes = 0
             response_truncated = False
             first_chunk = True
+            stream_error_info = None
+            stream_preface_retry_used = False
 
             async def iterator():
-                nonlocal response_truncated, total_response_bytes, first_chunk, lb_result_recorded
+                nonlocal response, status_code, response_truncated, total_response_bytes
+                nonlocal first_chunk, lb_result_recorded, stream_error_info, stream_preface_retry_used
                 try:
-                    async for chunk in response.aiter_bytes():
-                        if not chunk:
-                            continue
-
-                        current_duration = int((time.time() - start_time) * 1000)
-
-                        # 首次接收数据时标记为流式状态
-                        if first_chunk:
-                            await self.realtime_hub.request_streaming(request_id, current_duration)
-                            first_chunk = False
-
-                        # 尝试解码为文本发送实时更新
+                    while True:
                         try:
-                            chunk_text = chunk.decode('utf-8', errors='ignore')
-                            if chunk_text.strip():  # 只发送非空chunk
-                                await self.realtime_hub.response_chunk(
-                                    request_id, chunk_text, current_duration
-                                )
-                        except Exception:
-                            pass  # 忽略解码失败
+                            async for chunk in response.aiter_bytes():
+                                if not chunk:
+                                    continue
 
-                        total_response_bytes += len(chunk)
-                        if len(collected) < self.max_logged_response_bytes:
-                            remaining = self.max_logged_response_bytes - len(collected)
-                            collected.extend(chunk[:remaining])
-                            if len(chunk) > remaining:
-                                response_truncated = True
-                        else:
-                            response_truncated = True
-                        yield chunk
-                except Exception as stream_exc:
-                    # 流式传输中断（连接断开、解压错误等）
-                    # 注入 Anthropic 格式的 SSE error 事件，让客户端能正确识别错误
-                    if is_stream:
-                        error_data = json.dumps({
-                            "type": "error",
-                            "error": {"type": "api_error", "message": f"流式响应中断: {stream_exc}"}
-                        })
-                        yield f"event: error\ndata: {error_data}\n\n".encode('utf-8')
+                                current_duration = int((time.time() - start_time) * 1000)
+
+                                # 首次接收数据时标记为流式状态
+                                if first_chunk:
+                                    await self.realtime_hub.request_streaming(request_id, current_duration)
+                                    first_chunk = False
+
+                                # 尝试解码为文本发送实时更新
+                                try:
+                                    chunk_text = chunk.decode('utf-8', errors='ignore')
+                                    if chunk_text.strip():  # 只发送非空chunk
+                                        await self.realtime_hub.response_chunk(
+                                            request_id, chunk_text, current_duration
+                                        )
+                                except Exception:
+                                    pass  # 忽略解码失败
+
+                                total_response_bytes += len(chunk)
+                                if len(collected) < self.max_logged_response_bytes:
+                                    remaining = self.max_logged_response_bytes - len(collected)
+                                    collected.extend(chunk[:remaining])
+                                    if len(chunk) > remaining:
+                                        response_truncated = True
+                                else:
+                                    response_truncated = True
+                                yield chunk
+                            break
+                        except Exception as stream_exc:
+                            retryable = (
+                                is_stream and
+                                first_chunk and
+                                not stream_preface_retry_used and
+                                200 <= status_code < 300 and
+                                self._is_retryable_upstream_error(stream_exc)
+                            )
+                            upstream_attempts_log.append({
+                                "attempt": len(upstream_attempts_log) + 1,
+                                "phase": "before_first_chunk",
+                                "error_class": type(stream_exc).__name__,
+                                "message": str(stream_exc),
+                                "retryable": retryable,
+                            })
+
+                            if retryable:
+                                stream_preface_retry_used = True
+                                try:
+                                    await response.aclose()
+                                except Exception:
+                                    pass
+                                await self._rebuild_async_client(f"{type(stream_exc).__name__}: {stream_exc}")
+                                try:
+                                    response, retry_attempts = await self._send_upstream_request(
+                                        method=request.method,
+                                        url=target_url,
+                                        headers=target_headers,
+                                        content=filtered_body,
+                                        is_stream=is_stream,
+                                        max_retries=0,
+                                    )
+                                    upstream_attempts_log.extend(retry_attempts)
+                                    upstream_attempts_log.append({
+                                        "attempt": len(upstream_attempts_log) + 1,
+                                        "phase": "before_first_chunk_retry",
+                                        "result": "success",
+                                    })
+                                    status_code = response.status_code
+                                    if 200 <= status_code < 300:
+                                        continue
+                                    stream_exc = httpx.HTTPStatusError(
+                                        f"retry returned HTTP {status_code}",
+                                        request=response.request,
+                                        response=response,
+                                    )
+                                except httpx.RequestError as retry_exc:
+                                    stream_exc = retry_exc
+
+                            # 流式传输中断（连接断开、解压错误等）
+                            stream_error_info = {
+                                "phase": "after_first_chunk" if not first_chunk else "before_first_chunk",
+                                "error_class": type(stream_exc).__name__,
+                                "message": str(stream_exc),
+                                "retryable": False,
+                            }
+                            # 注入 Anthropic 格式的 SSE error 事件，让客户端能正确识别错误
+                            if is_stream:
+                                error_data = json.dumps({
+                                    "type": "error",
+                                    "error": {"type": "api_error", "message": f"流式响应中断: {stream_exc}"}
+                                })
+                                yield f"event: error\ndata: {error_data}\n\n".encode('utf-8')
+                            break
                 finally:
                     final_duration = int((time.time() - start_time) * 1000)
+                    final_status_code = 502 if stream_error_info else status_code
 
                     # 发送请求完成事件
                     try:
                         await self.realtime_hub.request_completed(
                             request_id=request_id,
-                            status_code=status_code,
+                            status_code=final_status_code,
                             duration_ms=final_duration,
-                            success=200 <= status_code < 400
+                            success=stream_error_info is None and 200 <= status_code < 400
                         )
                     except Exception:
                         pass
@@ -1194,7 +1419,7 @@ class BaseProxyService(ABC):
                         await self.log_request(
                             method=request.method,
                             path=path,
-                            status_code=status_code,
+                            status_code=final_status_code,
                             duration_ms=final_duration,
                             target_headers=target_headers,
                             filtered_body=filtered_body,
@@ -1206,13 +1431,15 @@ class BaseProxyService(ABC):
                             total_response_bytes=total_response_bytes,
                             target_url=target_url,
                             response_headers=response_headers_for_log,
+                            upstream_error=stream_error_info,
+                            upstream_attempts=upstream_attempts_log,
                         )
                     except Exception as log_exc:
                         print(f"流式响应日志记录异常: {log_exc}")
 
                     if not lb_result_recorded:
                         try:
-                            await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
+                            await asyncio.to_thread(self._record_lb_result, active_config_name, final_status_code)
                             lb_result_recorded = True
                         except Exception:
                             pass
@@ -1224,6 +1451,14 @@ class BaseProxyService(ABC):
             )
         except httpx.RequestError as exc:
             duration_ms = int((time.time() - start_time) * 1000)
+            send_failure_attempts = getattr(exc, "_clp_upstream_attempts", [])
+            upstream_attempts = upstream_attempts_log + send_failure_attempts
+            upstream_error = {
+                "phase": "send",
+                "error_class": type(exc).__name__,
+                "message": str(exc),
+                "retryable": self._is_retryable_upstream_error(exc),
+            }
 
             if isinstance(exc, httpx.ConnectTimeout):
                 error_msg = "连接超时"
@@ -1260,7 +1495,9 @@ class BaseProxyService(ABC):
                 original_headers=original_headers,
                 original_body=original_body,
                 channel=active_config_name,
-                target_url=target_url
+                target_url=target_url,
+                upstream_error=upstream_error,
+                upstream_attempts=upstream_attempts,
             )
 
             await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)

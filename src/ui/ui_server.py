@@ -1124,37 +1124,117 @@ def save_routing_config():
     """保存模型路由配置"""
     try:
         data = request.get_json()
-        
+
         if not data:
             return jsonify({'error': 'No configuration data provided'}), 400
-        
+
         # 验证配置格式
         required_fields = ['mode', 'modelMappings', 'configMappings']
         for field in required_fields:
             if field not in data:
                 return jsonify({'error': f'Missing required field: {field}'}), 400
-        
+
         # 验证模式
         if data['mode'] not in ['default', 'model-mapping', 'config-mapping']:
             return jsonify({'error': 'Invalid routing mode'}), 400
-        
+
         # 验证映射格式
         for service in ['claude', 'codex']:
             if service not in data['modelMappings']:
                 data['modelMappings'][service] = []
             if service not in data['configMappings']:
                 data['configMappings'][service] = []
-        
+
         routing_config_file = DATA_DIR / 'model_router_config.json'
-        
+
+        # 保留式合并：对 UI 不感知的扩展字段（如 modalityTargets）做保护，
+        # 防止前端整体 POST 时把磁盘上已存在的字段擦掉。
+        _merge_preserve_unknown_fields(routing_config_file, data)
+
         # 保存配置
         with open(routing_config_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
+
         return jsonify({'success': True, 'message': '路由配置保存成功'})
-    
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# UI 前端已知的 mapping 字段，其它字段视为"扩展字段"在保存时保留
+_KNOWN_MODEL_MAPPING_FIELDS = {'source', 'target', 'source_type'}
+_KNOWN_CONFIG_MAPPING_FIELDS = {'model', 'config'}
+
+
+def _merge_preserve_unknown_fields(routing_config_file, new_data):
+    """对 modelMappings / configMappings 里 UI 不认识的字段做保留式合并。
+
+    匹配规则：
+      - modelMappings: 按 (source_type, source) 作为 key 在旧配置中查找
+      - configMappings: 按 (model,) 作为 key 在旧配置中查找
+    命中后，凡是旧 mapping 中存在但新 mapping 中缺失、且非 UI 已知字段的键，
+    都合并到新 mapping 中。这样手工编辑或后续扩展的字段不会被前端覆盖。
+    """
+    if not routing_config_file.exists():
+        return
+
+    try:
+        with open(routing_config_file, 'r', encoding='utf-8') as f:
+            old_data = json.load(f)
+    except Exception:
+        return
+
+    # modelMappings
+    old_model = old_data.get('modelMappings', {}) if isinstance(old_data, dict) else {}
+    new_model = new_data.get('modelMappings', {})
+    for service in ['claude', 'codex']:
+        old_list = old_model.get(service, []) if isinstance(old_model, dict) else []
+        new_list = new_model.get(service, [])
+        if not isinstance(new_list, list):
+            continue
+        old_index = {}
+        for om in old_list:
+            if isinstance(om, dict):
+                key = (om.get('source_type', 'model'), om.get('source', ''))
+                old_index[key] = om
+        for nm in new_list:
+            if not isinstance(nm, dict):
+                continue
+            key = (nm.get('source_type', 'model'), nm.get('source', ''))
+            old = old_index.get(key)
+            if not old:
+                continue
+            for k, v in old.items():
+                if k in _KNOWN_MODEL_MAPPING_FIELDS:
+                    continue
+                if k not in nm:
+                    nm[k] = v
+
+    # configMappings
+    old_cfg = old_data.get('configMappings', {}) if isinstance(old_data, dict) else {}
+    new_cfg = new_data.get('configMappings', {})
+    for service in ['claude', 'codex']:
+        old_list = old_cfg.get(service, []) if isinstance(old_cfg, dict) else []
+        new_list = new_cfg.get(service, [])
+        if not isinstance(new_list, list):
+            continue
+        old_index = {}
+        for om in old_list:
+            if isinstance(om, dict):
+                key = (om.get('model', ''),)
+                old_index[key] = om
+        for nm in new_list:
+            if not isinstance(nm, dict):
+                continue
+            key = (nm.get('model', ''),)
+            old = old_index.get(key)
+            if not old:
+                continue
+            for k, v in old.items():
+                if k in _KNOWN_CONFIG_MAPPING_FIELDS:
+                    continue
+                if k not in nm:
+                    nm[k] = v
 
 @app.route('/api/test-connection', methods=['POST'])
 def test_connection():
