@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.13.3] - 2026-05-31
+
+### Fixed
+
+- 自动重试仅覆盖 30 秒内快速暴露的上游协议/连接错误；超过该窗口才断开的请求视为上游慢处理失败，不再重试，避免大上下文失败从约 180 秒拖到约 360 秒。
+- 上游请求日志的 `upstream_attempts` / `upstream_error` 新增 `elapsed_ms` 和 `retry_skipped_reason`，可直接看出是否因 `late_upstream_disconnect` 跳过重试。
+
 ## [1.13.2] - 2026-05-31
 
 ### Fixed

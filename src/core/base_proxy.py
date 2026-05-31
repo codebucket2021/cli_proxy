@@ -36,6 +36,10 @@ from .realtime_hub import RealTimeRequestHub
 
 class BaseProxyService(ABC):
     """基础代理服务类"""
+
+    # 只对快速暴露的协议/连接坏错做透明重试；长时间等待后断开通常是上游处理超时，
+    # 重试只会把用户等待从约 180 秒拉长到约 360 秒。
+    UPSTREAM_PROTOCOL_RETRY_MAX_ELAPSED_SECONDS = 30.0
     
     def __init__(self, service_name: str, port: int, config_manager):
         """
@@ -159,6 +163,15 @@ class BaseProxyService(ABC):
     def _is_retryable_upstream_error(self, exc: Exception) -> bool:
         return isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError))
 
+    def _can_retry_upstream_error(self, exc: Exception, elapsed_seconds: float, attempt: int, max_retries: int) -> Tuple[bool, Optional[str]]:
+        if not self._is_retryable_upstream_error(exc):
+            return False, "non_retryable_error"
+        if attempt >= max_retries:
+            return False, "retry_limit_reached"
+        if elapsed_seconds > self.UPSTREAM_PROTOCOL_RETRY_MAX_ELAPSED_SECONDS:
+            return False, "late_upstream_disconnect"
+        return True, None
+
     async def _send_upstream_request(
         self,
         method: str,
@@ -172,6 +185,7 @@ class BaseProxyService(ABC):
         attempts = []
         for attempt in range(max_retries + 1):
             client = self.client
+            attempt_started = time.monotonic()
             request_out = client.build_request(
                 method=method,
                 url=url,
@@ -185,20 +199,27 @@ class BaseProxyService(ABC):
                         "attempt": attempt + 1,
                         "phase": "send",
                         "result": "success",
+                        "elapsed_ms": int((time.monotonic() - attempt_started) * 1000),
                     })
                 return response, attempts
             except httpx.RequestError as exc:
-                retryable = self._is_retryable_upstream_error(exc)
+                elapsed_seconds = time.monotonic() - attempt_started
+                should_retry, skip_reason = self._can_retry_upstream_error(
+                    exc, elapsed_seconds, attempt, max_retries
+                )
                 attempt_info = {
                     "attempt": attempt + 1,
                     "phase": "send",
                     "error_class": type(exc).__name__,
                     "message": str(exc),
-                    "retryable": retryable and attempt < max_retries,
+                    "elapsed_ms": int(elapsed_seconds * 1000),
+                    "retryable": should_retry,
                 }
+                if skip_reason:
+                    attempt_info["retry_skipped_reason"] = skip_reason
                 attempts.append(attempt_info)
 
-                if not retryable or attempt >= max_retries:
+                if not should_retry:
                     setattr(exc, "_clp_upstream_attempts", attempts)
                     raise
 
@@ -1297,6 +1318,7 @@ class BaseProxyService(ABC):
                 nonlocal first_chunk, lb_result_recorded, stream_error_info, stream_preface_retry_used
                 try:
                     while True:
+                        stream_attempt_started = time.monotonic()
                         try:
                             async for chunk in response.aiter_bytes():
                                 if not chunk:
@@ -1330,20 +1352,31 @@ class BaseProxyService(ABC):
                                 yield chunk
                             break
                         except Exception as stream_exc:
+                            elapsed_seconds = time.monotonic() - stream_attempt_started
+                            should_retry, skip_reason = self._can_retry_upstream_error(
+                                stream_exc,
+                                elapsed_seconds,
+                                1 if stream_preface_retry_used else 0,
+                                1,
+                            )
                             retryable = (
                                 is_stream and
                                 first_chunk and
                                 not stream_preface_retry_used and
                                 200 <= status_code < 300 and
-                                self._is_retryable_upstream_error(stream_exc)
+                                should_retry
                             )
-                            upstream_attempts_log.append({
+                            attempt_info = {
                                 "attempt": len(upstream_attempts_log) + 1,
                                 "phase": "before_first_chunk",
                                 "error_class": type(stream_exc).__name__,
                                 "message": str(stream_exc),
+                                "elapsed_ms": int(elapsed_seconds * 1000),
                                 "retryable": retryable,
-                            })
+                            }
+                            if skip_reason:
+                                attempt_info["retry_skipped_reason"] = skip_reason
+                            upstream_attempts_log.append(attempt_info)
 
                             if retryable:
                                 stream_preface_retry_used = True
@@ -1383,8 +1416,11 @@ class BaseProxyService(ABC):
                                 "phase": "after_first_chunk" if not first_chunk else "before_first_chunk",
                                 "error_class": type(stream_exc).__name__,
                                 "message": str(stream_exc),
+                                "elapsed_ms": int(elapsed_seconds * 1000),
                                 "retryable": False,
                             }
+                            if skip_reason:
+                                stream_error_info["retry_skipped_reason"] = skip_reason
                             # 注入 Anthropic 格式的 SSE error 事件，让客户端能正确识别错误
                             if is_stream:
                                 error_data = json.dumps({
@@ -1453,12 +1489,16 @@ class BaseProxyService(ABC):
             duration_ms = int((time.time() - start_time) * 1000)
             send_failure_attempts = getattr(exc, "_clp_upstream_attempts", [])
             upstream_attempts = upstream_attempts_log + send_failure_attempts
+            last_attempt = upstream_attempts[-1] if upstream_attempts else {}
             upstream_error = {
                 "phase": "send",
                 "error_class": type(exc).__name__,
                 "message": str(exc),
-                "retryable": self._is_retryable_upstream_error(exc),
+                "elapsed_ms": last_attempt.get("elapsed_ms"),
+                "retryable": bool(last_attempt.get("retryable")),
             }
+            if last_attempt.get("retry_skipped_reason"):
+                upstream_error["retry_skipped_reason"] = last_attempt.get("retry_skipped_reason")
 
             if isinstance(exc, httpx.ConnectTimeout):
                 error_msg = "连接超时"
