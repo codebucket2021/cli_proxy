@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 import ssl
 import certifi
 import httpx
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -40,6 +40,9 @@ class BaseProxyService(ABC):
     # 只对快速暴露的协议/连接坏错做透明重试；长时间等待后断开通常是上游处理超时，
     # 重试只会把用户等待从约 180 秒拉长到约 360 秒。
     UPSTREAM_PROTOCOL_RETRY_MAX_ELAPSED_SECONDS = 30.0
+    LOG_BODY_PREVIEW_BYTES = 256 * 1024
+    LOG_TRIM_EXTRA_LINES = 20
+    LOG_FILE_LOCK_TIMEOUT_SECONDS = 5.0
     
     def __init__(self, service_name: str, port: int, config_manager):
         """
@@ -86,6 +89,11 @@ class BaseProxyService(ABC):
         self._client_rebuild_lock = asyncio.Lock()
         self.client = self._create_async_client()
 
+        # 日志写入使用单队列串行追加，避免并发重写 proxy_requests.jsonl
+        self._log_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._log_writer_task: Optional[asyncio.Task] = None
+        self._traffic_log_line_count: Optional[int] = None
+
         # 响应日志截断阈值（避免长流占用过多内存）
         self.max_logged_response_bytes = 1024 * 1024  # 1MB
 
@@ -102,8 +110,12 @@ class BaseProxyService(ABC):
         # 初始化FastAPI应用（使用 lifespan 管理生命周期）
         @asynccontextmanager
         async def lifespan(app):
-            yield
-            await self.client.aclose()
+            self._log_writer_task = asyncio.create_task(self._log_writer_loop())
+            try:
+                yield
+            finally:
+                await self._shutdown_log_writer()
+                await self.client.aclose()
 
         self.app = FastAPI(lifespan=lifespan)
         self._setup_routes()
@@ -278,64 +290,139 @@ class BaseProxyService(ABC):
         upstream_attempts: Optional[list] = None,
     ):
         """记录请求日志到jsonl文件（异步调度）"""
+        try:
+            log_entry = await asyncio.to_thread(
+                self._build_log_entry,
+                method, path, status_code, duration_ms, target_headers,
+                filtered_body, original_headers, original_body, response_content,
+                channel, usage, response_truncated, total_response_bytes,
+                target_url, response_headers, upstream_error, upstream_attempts,
+            )
+            await self._enqueue_log_entry(log_entry)
+        except Exception as exc:
+            print(f"日志记录失败: {exc}")
 
-        def _write_log():
+    def _build_log_entry(
+        self,
+        method: str,
+        path: str,
+        status_code: int,
+        duration_ms: int,
+        target_headers: Optional[Dict],
+        filtered_body: Optional[bytes],
+        original_headers: Optional[Dict],
+        original_body: Optional[bytes],
+        response_content: Optional[bytes],
+        channel: Optional[str],
+        usage: Optional[Dict[str, Any]],
+        response_truncated: bool,
+        total_response_bytes: Optional[int],
+        target_url: Optional[str],
+        response_headers: Optional[Dict],
+        upstream_error: Optional[Dict[str, Any]],
+        upstream_attempts: Optional[list],
+    ) -> dict:
+        log_entry = {
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'service': self.service_name,
+            'method': method,
+            'path': target_url if target_url else path,
+            'status_code': status_code,
+            'duration_ms': duration_ms,
+            'target_headers': target_headers or {}
+        }
+
+        if channel:
+            log_entry['channel'] = channel
+
+        if original_headers:
+            log_entry['original_headers'] = original_headers
+
+        if original_body:
+            self._store_log_bytes(log_entry, 'original_body', original_body, self.LOG_BODY_PREVIEW_BYTES)
+
+        if filtered_body:
+            if original_body and filtered_body == original_body:
+                log_entry['filtered_body_same_as_original'] = True
+                log_entry['filtered_body_bytes'] = len(filtered_body)
+                log_entry['filtered_body_logged_bytes'] = log_entry.get('original_body_logged_bytes', len(filtered_body))
+                if log_entry.get('original_body_truncated'):
+                    log_entry['filtered_body_truncated'] = True
+            else:
+                self._store_log_bytes(log_entry, 'filtered_body', filtered_body, self.LOG_BODY_PREVIEW_BYTES)
+
+        usage_record = usage
+        if usage_record is None:
+            usage_record = extract_usage_from_response(self.service_name, response_content)
+        usage_record = normalize_usage_record(self.service_name, usage_record)
+        log_entry['usage'] = usage_record
+
+        if response_content:
+            self._store_log_bytes(log_entry, 'response_content', response_content, self.max_logged_response_bytes)
+
+        if response_headers:
+            log_entry['response_headers'] = response_headers
+
+        if response_truncated:
+            log_entry['response_truncated'] = True
+
+        if total_response_bytes is not None:
+            log_entry['response_bytes'] = total_response_bytes
+
+        if upstream_error:
+            log_entry['upstream_error'] = upstream_error
+
+        if upstream_attempts:
+            log_entry['upstream_attempts'] = upstream_attempts
+            log_entry['upstream_retry_count'] = sum(
+                1 for attempt in upstream_attempts if attempt.get('retryable')
+            )
+
+        return log_entry
+
+    def _store_log_bytes(self, log_entry: dict, field: str, content: bytes, limit: int):
+        total_bytes = len(content)
+        logged = content[:limit] if limit and total_bytes > limit else content
+        log_entry[field] = base64.b64encode(logged).decode('utf-8')
+        log_entry[f'{field}_bytes'] = total_bytes
+        log_entry[f'{field}_logged_bytes'] = len(logged)
+        if len(logged) < total_bytes:
+            log_entry[f'{field}_truncated'] = True
+
+    async def _enqueue_log_entry(self, log_entry: dict):
+        if self._log_writer_task is None or self._log_writer_task.done():
+            await asyncio.to_thread(self._append_log_entry, log_entry)
+            return
+        await self._log_queue.put(log_entry)
+
+    async def _log_writer_loop(self):
+        self._traffic_log_line_count = await asyncio.to_thread(self._count_traffic_log_lines)
+        while True:
+            log_entry = await self._log_queue.get()
             try:
-                log_entry = {
-                    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
-                    'service': self.service_name,
-                    'method': method,
-                    'path': target_url if target_url else path,
-                    'status_code': status_code,
-                    'duration_ms': duration_ms,
-                    'target_headers': target_headers or {}
-                }
-
-                if channel:
-                    log_entry['channel'] = channel
-
-                if filtered_body:
-                    log_entry['filtered_body'] = base64.b64encode(filtered_body).decode('utf-8')
-
-                if original_headers:
-                    log_entry['original_headers'] = original_headers
-
-                if original_body:
-                    log_entry['original_body'] = base64.b64encode(original_body).decode('utf-8')
-
-                usage_record = usage
-                if usage_record is None:
-                    usage_record = extract_usage_from_response(self.service_name, response_content)
-                usage_record = normalize_usage_record(self.service_name, usage_record)
-                log_entry['usage'] = usage_record
-
-                if response_content:
-                    log_entry['response_content'] = base64.b64encode(response_content).decode('utf-8')
-
-                if response_headers:
-                    log_entry['response_headers'] = response_headers
-
-                if response_truncated:
-                    log_entry['response_truncated'] = True
-
-                if total_response_bytes is not None:
-                    log_entry['response_bytes'] = total_response_bytes
-
-                if upstream_error:
-                    log_entry['upstream_error'] = upstream_error
-
-                if upstream_attempts:
-                    log_entry['upstream_attempts'] = upstream_attempts
-                    log_entry['upstream_retry_count'] = sum(
-                        1 for attempt in upstream_attempts if attempt.get('retryable')
+                if log_entry is None:
+                    return
+                await asyncio.to_thread(self._append_log_entry, log_entry)
+                self._traffic_log_line_count = (self._traffic_log_line_count or 0) + 1
+                max_logs = self._get_log_limit()
+                if self._traffic_log_line_count > max_logs + self.LOG_TRIM_EXTRA_LINES:
+                    self._traffic_log_line_count = await asyncio.to_thread(
+                        self._trim_traffic_log_to_limit, max_logs
                     )
-
-                # 限制日志文件为最多100条记录
-                self._maintain_log_limit(log_entry)
             except Exception as exc:
-                print(f"日志记录失败: {exc}")
+                print(f"日志写入队列处理失败: {exc}")
+            finally:
+                self._log_queue.task_done()
 
-        await asyncio.to_thread(_write_log)
+    async def _shutdown_log_writer(self):
+        if self._log_writer_task is None:
+            return
+        try:
+            await self._log_queue.join()
+            await self._log_queue.put(None)
+            await asyncio.wait_for(self._log_writer_task, timeout=10.0)
+        except Exception as exc:
+            print(f"关闭日志写入队列失败: {exc}")
 
     def _save_discarded_logs_usage(self, discarded_logs: list[dict]) -> None:
         """将被丢弃的日志的usage数据保存到历史记录"""
@@ -406,52 +493,121 @@ class BaseProxyService(ABC):
         except Exception as exc:
             print(f"保存被丢弃日志的usage失败: {exc}")
 
-    def _maintain_log_limit(self, new_log_entry: dict):
-        """维护日志文件条数限制，只保留最近的max_logs条记录"""
+    def _get_log_limit(self) -> int:
+        system_config_file = self.data_dir / 'system.json'
+        max_logs = 50
         try:
-            # 从系统配置文件读取日志限制数量
-            system_config_file = self.data_dir / 'system.json'
-            max_logs = 50  # 默认值
-            try:
-                if system_config_file.exists():
-                    with open(system_config_file, 'r', encoding='utf-8') as f:
-                        system_config = json.load(f)
-                        max_logs = system_config.get('logLimit', 50)
-            except (json.JSONDecodeError, OSError) as e:
-                print(f"读取系统配置失败，使用默认日志限制 {max_logs}: {e}")
+            if system_config_file.exists():
+                with open(system_config_file, 'r', encoding='utf-8') as f:
+                    system_config = json.load(f)
+                    max_logs = int(system_config.get('logLimit', 50))
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            print(f"读取系统配置失败，使用默认日志限制 {max_logs}: {exc}")
+        return max(1, max_logs)
 
-            # 读取现有日志
-            existing_logs = []
-            if self.traffic_log.exists():
+    @contextmanager
+    def _traffic_log_lock(self):
+        lock_path = self.traffic_log.with_name(f'{self.traffic_log.name}.lock')
+        fd = None
+        start = time.monotonic()
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                break
+            except FileExistsError:
+                if time.monotonic() - start > self.LOG_FILE_LOCK_TIMEOUT_SECONDS:
+                    try:
+                        if time.time() - lock_path.stat().st_mtime > 30:
+                            try:
+                                lock_path.unlink()
+                            except FileNotFoundError:
+                                pass
+                            continue
+                    except OSError:
+                        pass
+                    raise TimeoutError(f"获取日志文件锁超时: {lock_path}")
+                time.sleep(0.05)
+
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def _append_log_entry(self, log_entry: dict):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(log_entry, ensure_ascii=False) + '\n'
+        with self._traffic_log_lock():
+            with open(self.traffic_log, 'a', encoding='utf-8') as f:
+                f.write(line)
+
+    def _count_traffic_log_lines(self) -> int:
+        if not self.traffic_log.exists():
+            return 0
+        try:
+            with self._traffic_log_lock():
+                with open(self.traffic_log, 'r', encoding='utf-8') as f:
+                    return sum(1 for line in f if line.strip())
+        except Exception as exc:
+            print(f"统计日志条数失败: {exc}")
+            return 0
+
+    def _trim_traffic_log_to_limit(self, max_logs: int) -> int:
+        try:
+            existing_logs: list[dict] = []
+            malformed_lines: list[str] = []
+            with self._traffic_log_lock():
+                if not self.traffic_log.exists():
+                    return 0
+
+                # 只有后台裁剪时才读取全量日志；普通请求完成只追加单行。
                 with open(self.traffic_log, 'r', encoding='utf-8') as f:
                     for line in f:
-                        line = line.strip()
-                        if line:
-                            try:
-                                log_data = json.loads(line)
-                                existing_logs.append(log_data)
-                            except json.JSONDecodeError:
-                                continue
+                        raw = line.strip()
+                        if not raw:
+                            continue
+                        try:
+                            existing_logs.append(json.loads(raw))
+                        except json.JSONDecodeError:
+                            malformed_lines.append(raw)
 
-            # 添加新日志条目
-            existing_logs.append(new_log_entry)
+                if len(existing_logs) <= max_logs:
+                    return len(existing_logs)
 
-            # 只保留最近的max_logs条记录
-            if len(existing_logs) > max_logs:
-                # 保存即将被丢弃的日志的usage数据到历史记录
                 discarded_logs = existing_logs[:-max_logs]
+                kept_logs = existing_logs[-max_logs:]
                 self._save_discarded_logs_usage(discarded_logs)
 
-                existing_logs = existing_logs[-max_logs:]
-            
-            # 重写整个日志文件
-            with open(self.traffic_log, 'w', encoding='utf-8') as f:
-                for log_entry in existing_logs:
-                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
-                    
+                with open(self.traffic_log, 'w', encoding='utf-8') as f:
+                    for raw in malformed_lines[-5:]:
+                        f.write(raw + '\n')
+                    for log_entry in kept_logs:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+
+                return len(kept_logs) + min(len(malformed_lines), 5)
+        except Exception as exc:
+            print(f"裁剪日志文件失败: {exc}")
+            return self._traffic_log_line_count or 0
+
+    def _maintain_log_limit(self, new_log_entry: dict):
+        """兼容旧调用：追加日志并在超过阈值时裁剪。"""
+        try:
+            self._append_log_entry(new_log_entry)
+            max_logs = self._get_log_limit()
+            current_count = self._count_traffic_log_lines()
+            if current_count > max_logs + self.LOG_TRIM_EXTRA_LINES:
+                self._trim_traffic_log_to_limit(max_logs)
         except Exception as exc:
             print(f"维护日志文件限制失败: {exc}")
-            # 如果维护失败，直接追加写入
             try:
                 with open(self.traffic_log, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(new_log_entry, ensure_ascii=False) + '\n')

@@ -3150,21 +3150,26 @@ const app = createApp({
         };
 
         const showLogDetail = (log) => {
-            selectedLog.value = log;
+            const displayLog = { ...log };
+            if (displayLog.filtered_body_same_as_original && !displayLog.filtered_body) {
+                displayLog.filtered_body = displayLog.original_body;
+            }
+
+            selectedLog.value = displayLog;
             activeLogTab.value = 'basic'; // 重置到基本信息tab
             logDetailVisible.value = true;
 
-            decodedRequestBody.value = decodeBodyContent(log.filtered_body);
-            decodedOriginalRequestBody.value = decodeBodyContent(log.original_body);
-            responseOriginalContent.value = decodeBodyContent(log.response_content);
-            const serviceName = (log?.service || '').toLowerCase();
+            decodedRequestBody.value = decodeBodyContent(displayLog.filtered_body);
+            decodedOriginalRequestBody.value = decodeBodyContent(displayLog.original_body);
+            responseOriginalContent.value = decodeBodyContent(displayLog.response_content);
+            const serviceName = (displayLog?.service || '').toLowerCase();
             isCodexLog.value = serviceName === 'codex';
             isClaudeLog.value = serviceName === 'claude';
 
             const shouldAttemptParse = (isCodexLog.value || isClaudeLog.value) && !!responseOriginalContent.value;
 
             if (shouldAttemptParse) {
-                const parsedResult = parseResponseLogContent(responseOriginalContent.value, log?.service);
+                const parsedResult = parseResponseLogContent(responseOriginalContent.value, displayLog?.service);
                 if (parsedResult.success) {
                     parsedResponseContent.value = parsedResult.text;
                     decodedResponseContent.value = parsedResponseContent.value;

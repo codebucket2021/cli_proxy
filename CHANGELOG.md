@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.13.4] - 2026-05-31
+
+### Changed
+
+- 请求日志写入改为后台单队列串行追加，普通请求完成时不再读取并重写整个 `proxy_requests.jsonl`，降低多人共享时的磁盘 IO、JSON 解析开销和并发覆盖风险。
+- 日志裁剪改为超过 `logLimit` 缓冲阈值后后台批量执行，仍会把被裁剪日志的 usage 聚合到 `history_usage.json`。
+- 请求体日志默认只保留前 256KB，并记录 `*_bytes`、`*_logged_bytes`、`*_truncated` 元信息，避免大上下文请求把单条日志撑到数 MB。
+- 当 `filtered_body` 与 `original_body` 完全一致时只保存一份内容，并通过 `filtered_body_same_as_original` 复用展示，减少重复存储。
+
 ## [1.13.3] - 2026-05-31
 
 ### Fixed
