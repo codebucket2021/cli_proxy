@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.13.5] - 2026-06-08
+
+### Added
+
+- 组级 key 重试策略支持配置 `max_consecutive_fatal_failures`、`max_consecutive_quota_failures`、`max_key_retries_per_request`、`quota_status_codes`、`quota_error_types`、`disable_quota_until_reset`。
+- `429 + usage_limit_reached` 单独走 quota 分支，默认最多连续尝试 30 个 quota key、单请求最多尝试 50 个 fatal key，避免大号池 3 个 quota 429 后过早返回客户端。
+- quota 429 会按上游 `resets_at` 写入 key 的 `disabled_until`，到期后自动恢复，避免把可恢复额度错误永久禁用。
+
+### Changed
+
+- 普通 fatal 错误仍默认连续 3 次停止重试，用于保留 Cloudflare/WAF、网络、认证链路异常的全局保护。
+
 ## [1.13.4] - 2026-05-31
 
 ### Changed

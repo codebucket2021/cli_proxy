@@ -43,6 +43,11 @@ class BaseProxyService(ABC):
     LOG_BODY_PREVIEW_BYTES = 256 * 1024
     LOG_TRIM_EXTRA_LINES = 20
     LOG_FILE_LOCK_TIMEOUT_SECONDS = 5.0
+    DEFAULT_MAX_CONSECUTIVE_FATAL_FAILURES = 3
+    DEFAULT_MAX_CONSECUTIVE_QUOTA_FAILURES = 30
+    DEFAULT_MAX_KEY_RETRIES_PER_REQUEST = 50
+    DEFAULT_QUOTA_STATUS_CODES = {429}
+    DEFAULT_QUOTA_ERROR_TYPES = {'usage_limit_reached'}
     
     def __init__(self, service_name: str, port: int, config_manager):
         """
@@ -1129,6 +1134,137 @@ class BaseProxyService(ABC):
             return set(codes)
         return self.DEFAULT_FATAL_STATUS_CODES
 
+    @staticmethod
+    def _coerce_positive_int(value: Any, default: int, minimum: int = 1) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return number if number >= minimum else default
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {'1', 'true', 'yes', 'on'}:
+                return True
+            if normalized in {'0', 'false', 'no', 'off'}:
+                return False
+        return default
+
+    @staticmethod
+    def _coerce_status_codes(value: Any, default: set) -> set:
+        if value is None:
+            return set(default)
+        if isinstance(value, (str, int)):
+            value = [value]
+        if not isinstance(value, (list, tuple, set)):
+            return set(default)
+
+        codes = set()
+        for item in value:
+            try:
+                codes.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        return codes or set(default)
+
+    @staticmethod
+    def _coerce_string_set(value: Any, default: set) -> set:
+        if value is None:
+            return set(default)
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, (list, tuple, set)):
+            return set(default)
+
+        items = {str(item).strip().lower() for item in value if str(item).strip()}
+        return items if items else set(default)
+
+    @staticmethod
+    def _coerce_timestamp(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            timestamp = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return timestamp if timestamp > 0 else None
+
+    def _get_key_retry_policy(self, group_name: Optional[str]) -> Dict[str, Any]:
+        group_data: Dict[str, Any] = {}
+        if group_name:
+            group_data = self.config_manager.groups.get(group_name, {})
+
+        return {
+            'max_consecutive_fatal_failures': self._coerce_positive_int(
+                group_data.get('max_consecutive_fatal_failures'),
+                self.DEFAULT_MAX_CONSECUTIVE_FATAL_FAILURES,
+            ),
+            'max_consecutive_quota_failures': self._coerce_positive_int(
+                group_data.get('max_consecutive_quota_failures'),
+                self.DEFAULT_MAX_CONSECUTIVE_QUOTA_FAILURES,
+            ),
+            'max_key_retries_per_request': self._coerce_positive_int(
+                group_data.get('max_key_retries_per_request'),
+                self.DEFAULT_MAX_KEY_RETRIES_PER_REQUEST,
+            ),
+            'quota_status_codes': self._coerce_status_codes(
+                group_data.get('quota_status_codes'),
+                self.DEFAULT_QUOTA_STATUS_CODES,
+            ),
+            'quota_error_types': self._coerce_string_set(
+                group_data.get('quota_error_types'),
+                self.DEFAULT_QUOTA_ERROR_TYPES,
+            ),
+            'disable_quota_until_reset': self._coerce_bool(
+                group_data.get('disable_quota_until_reset'),
+                True,
+            ),
+        }
+
+    def _parse_error_body(self, error_body: Optional[bytes]) -> Dict[str, Any]:
+        text = ''
+        if error_body:
+            try:
+                text = error_body.decode('utf-8', errors='ignore')
+            except Exception:
+                text = ''
+
+        error_type = ''
+        resets_at = None
+        if text:
+            try:
+                payload = json.loads(text)
+                error = payload.get('error') if isinstance(payload, dict) else None
+                if isinstance(error, dict):
+                    error_type = str(error.get('type') or '').strip().lower()
+                    resets_at = self._coerce_timestamp(error.get('resets_at'))
+                    if resets_at is None:
+                        resets_in_seconds = self._coerce_timestamp(error.get('resets_in_seconds'))
+                        if resets_in_seconds is not None:
+                            resets_at = int(time.time()) + resets_in_seconds
+            except Exception:
+                pass
+
+        return {
+            'text': text[:200],
+            'error_type': error_type,
+            'resets_at': resets_at,
+        }
+
+    @staticmethod
+    def _is_quota_error(status_code: int, error_info: Dict[str, Any], retry_policy: Dict[str, Any]) -> bool:
+        if status_code not in retry_policy.get('quota_status_codes', set()):
+            return False
+        quota_error_types = retry_policy.get('quota_error_types', set())
+        error_type = str(error_info.get('error_type') or '').strip().lower()
+        if not quota_error_types:
+            return True
+        return bool(error_type and error_type in quota_error_types)
+
     def _select_key_from_group(self, group_name: str, group_data: Dict[str, Any], exclude_keys: set = None) -> Optional[Dict[str, Any]]:
         """
         从组中选择一个 key，基于空闲超时轮转策略:
@@ -1314,12 +1450,13 @@ class BaseProxyService(ABC):
             # Key 错误感知重试: 遇到组配置的 fatal_status_codes 时禁用当前 key 并尝试下一个
             excluded_keys: set = set()
             response = None
-            MAX_CONSECUTIVE_FAILURES = 3  # 连续同状态码失败上限，超过视为全局性错误
 
             # 获取当前组的 fatal_status_codes（未配置则为空集，不触发自动禁用）
             fatal_codes = self._get_fatal_status_codes(active_group_name)
+            retry_policy = self._get_key_retry_policy(active_group_name)
+            fatal_response_count = 0
             consecutive_same_code = 0
-            last_fatal_code = None
+            last_fatal_key = None
 
             while True:
                 response, send_attempts = await self._send_upstream_request(
@@ -1346,26 +1483,45 @@ class BaseProxyService(ABC):
                     error_body = response.content
 
                 # 检测是否为非 key 级别的错误（如 HTML 响应 = Cloudflare/WAF 拦截）
-                error_text = ''
-                try:
-                    error_text = error_body.decode('utf-8', errors='ignore')[:200] if error_body else ''
-                except Exception:
-                    pass
+                error_info = self._parse_error_body(error_body)
+                error_text = error_info.get('text', '')
                 is_non_key_error = error_text.lstrip().startswith('<')  # HTML 响应不是 API 错误
+                is_quota_error = self._is_quota_error(status_code, error_info, retry_policy)
+                fatal_response_count += 1
 
-                # 连续相同状态码计数
-                if status_code == last_fatal_code:
+                # 连续相同 key 故障类型计数；quota 429 和普通 429 使用不同阈值。
+                current_fatal_key = (status_code, 'quota' if is_quota_error else 'fatal')
+                if current_fatal_key == last_fatal_key:
                     consecutive_same_code += 1
                 else:
                     consecutive_same_code = 1
-                    last_fatal_code = status_code
+                    last_fatal_key = current_fatal_key
 
-                # 如果是非 key 级别错误，或连续失败超限，停止重试且不禁用 key
-                if is_non_key_error or consecutive_same_code >= MAX_CONSECUTIVE_FAILURES:
+                max_consecutive_failures = (
+                    retry_policy['max_consecutive_quota_failures']
+                    if is_quota_error
+                    else retry_policy['max_consecutive_fatal_failures']
+                )
+
+                # 如果是非 key 级别错误、连续失败超限、或单请求重试超限，停止重试且不禁用当前 key
+                if (
+                    is_non_key_error
+                    or consecutive_same_code >= max_consecutive_failures
+                    or fatal_response_count >= retry_policy['max_key_retries_per_request']
+                ):
                     if is_non_key_error:
                         print(f"[KEY重试] 检测到非API错误(HTML响应)，停止重试，不禁用 key")
+                    elif fatal_response_count >= retry_policy['max_key_retries_per_request']:
+                        print(
+                            f"[KEY重试] 单请求已尝试 {fatal_response_count} 个 fatal key，"
+                            f"达到 max_key_retries_per_request={retry_policy['max_key_retries_per_request']}，停止重试"
+                        )
                     else:
-                        print(f"[KEY重试] 连续 {consecutive_same_code} 个 key 返回 HTTP {status_code}，判定为全局性错误，停止重试")
+                        failure_kind = "quota" if is_quota_error else "fatal"
+                        print(
+                            f"[KEY重试] 连续 {consecutive_same_code} 个 key 返回 HTTP {status_code} ({failure_kind})，"
+                            f"达到阈值 {max_consecutive_failures}，停止重试"
+                        )
                     break
 
                 # 禁用当前 key
@@ -1373,8 +1529,15 @@ class BaseProxyService(ABC):
                 reason = f"HTTP {status_code}"
                 if error_text:
                     reason = f"HTTP {status_code}: {error_text}"
+                disabled_until = None
+                if is_quota_error and retry_policy['disable_quota_until_reset']:
+                    disabled_until = error_info.get('resets_at')
                 await asyncio.to_thread(
-                    self.config_manager.disable_key, active_group_name, active_config_name, reason
+                    self.config_manager.disable_key,
+                    active_group_name,
+                    active_config_name,
+                    reason,
+                    disabled_until,
                 )
                 await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
 
@@ -1383,6 +1546,8 @@ class BaseProxyService(ABC):
                     target_url, target_headers, target_body, active_config_name, active_group_name = \
                         self.build_target_param(path, request, original_body, exclude_keys=excluded_keys)
                     filtered_body = await asyncio.to_thread(self.apply_request_filter, target_body)
+                    fatal_codes = self._get_fatal_status_codes(active_group_name)
+                    retry_policy = self._get_key_retry_policy(active_group_name)
                     print(f"[KEY重试] 切换到 key={active_config_name}，已排除: {excluded_keys}")
                 except ValueError:
                     # 没有更多可用 key，返回最后一次的错误响应

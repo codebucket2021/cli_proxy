@@ -19,6 +19,12 @@
       "base_url": "https://example.com/v1",
       "auth_type": "api_key",
       "fatal_status_codes": [401, 402, 403, 429],
+      "quota_status_codes": [429],
+      "quota_error_types": ["usage_limit_reached"],
+      "max_consecutive_fatal_failures": 3,
+      "max_consecutive_quota_failures": 30,
+      "max_key_retries_per_request": 50,
+      "disable_quota_until_reset": true,
       "keys": [...]
     }
   }
@@ -83,6 +89,43 @@ class CachedConfigManager:
         self._ensure_config_dir()
         with open(self.config_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _coerce_timestamp(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            timestamp = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return timestamp if timestamp > 0 else None
+
+    def _clear_expired_temporary_disabled(self, raw: Dict[str, Any]) -> bool:
+        now = int(time.time())
+        changed = False
+        groups = raw.get('__groups', {})
+        if not isinstance(groups, dict):
+            return False
+
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            keys = group.get('keys', [])
+            if not isinstance(keys, list):
+                continue
+            for key in keys:
+                if not isinstance(key, dict):
+                    continue
+                disabled_until = self._coerce_timestamp(key.get('disabled_until'))
+                if disabled_until is None or disabled_until > now:
+                    continue
+                key['disabled'] = False
+                key.pop('disabled_until', None)
+                key.pop('disable_type', None)
+                key.pop('reason', None)
+                changed = True
+
+        return changed
 
     # ── v1 → v2 迁移 ──
 
@@ -197,10 +240,16 @@ class CachedConfigManager:
             self._active_group_cache = None
             self._rotation_cache = {'idle_timeout': 300}
         elif self._is_v2(raw):
+            if self._clear_expired_temporary_disabled(raw):
+                try:
+                    self._write_json(raw)
+                except OSError as e:
+                    print(f"清理临时禁用状态写入失败: {e}")
             self._groups_cache, self._active_group_cache, self._rotation_cache = self._parse_v2(raw)
         else:
             # v1 → v2 迁移
             v2_data = self._migrate_v1_to_v2(raw)
+            self._clear_expired_temporary_disabled(v2_data)
             try:
                 self._write_json(v2_data)
             except OSError as e:
@@ -261,7 +310,13 @@ class CachedConfigManager:
                 print(f"设置活跃组失败: {e}")
                 return False
 
-    def disable_key(self, group_name: str, key_name: str, reason: str = '') -> bool:
+    def disable_key(
+        self,
+        group_name: str,
+        key_name: str,
+        reason: str = '',
+        disabled_until: Optional[int] = None,
+    ) -> bool:
         """将指定组中的 key 标记为 disabled，持久化到配置文件"""
         with self._lock:
             try:
@@ -275,11 +330,19 @@ class CachedConfigManager:
                 for key in group.get('keys', []):
                     if key.get('name') == key_name:
                         key['disabled'] = True
+                        until = self._coerce_timestamp(disabled_until)
+                        if until is not None:
+                            key['disabled_until'] = until
+                            key['disable_type'] = 'temporary'
+                        else:
+                            key.pop('disabled_until', None)
+                            key.pop('disable_type', None)
                         if reason:
                             key['reason'] = reason
                         self._write_json(raw)
                         self._refresh_cache()
-                        print(f"[KEY禁用] 组={group_name} key={key_name} 原因={reason}")
+                        until_text = f" until={until}" if until is not None else ""
+                        print(f"[KEY禁用] 组={group_name} key={key_name}{until_text} 原因={reason}")
                         return True
                 return False
             except Exception as e:
