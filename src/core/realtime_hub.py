@@ -104,7 +104,9 @@ class RealTimeRequestHub:
         message = json.dumps(event_data, ensure_ascii=False)
         disconnected = set()
 
-        for i, connection in enumerate(self.connections):
+        # 遍历连接集合的快照，避免广播期间另一个请求 add/remove 连接
+        # 导致 "Set changed size during iteration" 崩溃
+        for i, connection in enumerate(list(self.connections)):
             try:
                 await connection.send_text(message)
             except Exception as e:

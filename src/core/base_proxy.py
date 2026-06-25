@@ -43,6 +43,7 @@ class BaseProxyService(ABC):
     LOG_BODY_PREVIEW_BYTES = 256 * 1024
     LOG_TRIM_EXTRA_LINES = 20
     LOG_FILE_LOCK_TIMEOUT_SECONDS = 5.0
+    CLIENT_DISCONNECT_POLL_SECONDS = 3.0
     DEFAULT_MAX_CONSECUTIVE_FATAL_FAILURES = 3
     DEFAULT_MAX_CONSECUTIVE_QUOTA_FAILURES = 30
     DEFAULT_MAX_KEY_RETRIES_PER_REQUEST = 50
@@ -415,8 +416,11 @@ class BaseProxyService(ABC):
             await asyncio.to_thread(self._append_log_entry, log_entry)
 
     async def _log_writer_loop(self):
+        # 写日志在本后台串行 task 内直接同步执行，不再走 asyncio.to_thread：
+        # 高并发重试风暴下线程池会被请求路径的 to_thread(日志构建/lb 统计等)占满，
+        # 导致写日志的 to_thread 永久排队、jsonl 停写。后台单 task 串行直写文件开销很小。
         try:
-            self._traffic_log_line_count = await asyncio.to_thread(self._count_traffic_log_lines)
+            self._traffic_log_line_count = self._count_traffic_log_lines()
         except Exception as exc:
             print(f"统计流量日志行数失败，从 0 计: {exc}")
             self._traffic_log_line_count = 0
@@ -425,13 +429,11 @@ class BaseProxyService(ABC):
             try:
                 if log_entry is None:
                     return
-                await asyncio.to_thread(self._append_log_entry, log_entry)
+                self._append_log_entry(log_entry)
                 self._traffic_log_line_count = (self._traffic_log_line_count or 0) + 1
                 max_logs = self._get_log_limit()
                 if self._traffic_log_line_count > max_logs + self.LOG_TRIM_EXTRA_LINES:
-                    self._traffic_log_line_count = await asyncio.to_thread(
-                        self._trim_traffic_log_to_limit, max_logs
-                    )
+                    self._traffic_log_line_count = self._trim_traffic_log_to_limit(max_logs)
             except Exception as exc:
                 print(f"日志写入队列处理失败: {exc}")
             finally:
@@ -1657,19 +1659,36 @@ class BaseProxyService(ABC):
                 nonlocal response, status_code, response_truncated, total_response_bytes
                 nonlocal first_chunk, lb_result_recorded, stream_error_info, stream_preface_retry_used
                 nonlocal client_disconnected
+
+                async def _watch_client_disconnect():
+                    # 独立轮询客户端是否断开：覆盖 anyrouter 出首字后长时间静默、
+                    # 转发循环卡在 aiter_bytes 等待、无法在循环体内自检的情况。
+                    # 断开则关闭上游响应，令 aiter_bytes 抛错退出转发。
+                    nonlocal client_disconnected
+                    try:
+                        while not client_disconnected:
+                            await asyncio.sleep(self.CLIENT_DISCONNECT_POLL_SECONDS)
+                            if await request.is_disconnected():
+                                client_disconnected = True
+                                try:
+                                    await response.aclose()
+                                except Exception:
+                                    pass
+                                return
+                    except asyncio.CancelledError:
+                        return
+
+                disconnect_watcher = asyncio.ensure_future(_watch_client_disconnect())
                 try:
                     while True:
                         stream_attempt_started = time.monotonic()
                         try:
                             async for chunk in response.aiter_bytes():
+                                # watcher 已探测到客户端断开 → 立即停止转发
+                                if client_disconnected:
+                                    return
                                 if not chunk:
                                     continue
-
-                                # 客户端断开感知：cc 侧 watchdog abort 后立即停止转发，
-                                # return 触发 finally 掐断上游，避免幽灵请求白跑/计费
-                                if await request.is_disconnected():
-                                    client_disconnected = True
-                                    return
 
                                 current_duration = int((time.time() - start_time) * 1000)
 
@@ -1699,6 +1718,10 @@ class BaseProxyService(ABC):
                                 yield chunk
                             break
                         except Exception as stream_exc:
+                            if client_disconnected:
+                                # 上游响应被 watcher 主动关闭（客户端已断开），
+                                # 不作为上游错误重试，直接结束（finally 记 499）
+                                return
                             elapsed_seconds = time.monotonic() - stream_attempt_started
                             should_retry, skip_reason = self._can_retry_upstream_error(
                                 stream_exc,
@@ -1777,6 +1800,7 @@ class BaseProxyService(ABC):
                                 yield f"event: error\ndata: {error_data}\n\n".encode('utf-8')
                             break
                 finally:
+                    disconnect_watcher.cancel()
                     final_duration = int((time.time() - start_time) * 1000)
                     if client_disconnected:
                         # 客户端主动断开（如 cc 流式 watchdog abort）：记 499，非成功
