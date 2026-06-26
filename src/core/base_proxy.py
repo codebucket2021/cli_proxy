@@ -49,6 +49,11 @@ class BaseProxyService(ABC):
     DEFAULT_MAX_KEY_RETRIES_PER_REQUEST = 50
     DEFAULT_QUOTA_STATUS_CODES = {429}
     DEFAULT_QUOTA_ERROR_TYPES = {'usage_limit_reached'}
+    # 流式转发保活：上游静默超过该秒数就给客户端注入一个 SSE 注释帧。anyrouter 长
+    # thinking 时 body 会静默数十秒~数分钟，期间 clp 一个字节都不发，cc(尤其 2.1.185+
+    # 字节级 idle 看门狗)会判连接卡死、提前放弃并重发→旧请求后台仍跑完 cc 不收→"错位"。
+    # 注入保活让 cc↔clp 永不 idle。取值需远小于 cc 最短 idle 阈值(约 180s)。
+    SSE_KEEPALIVE_SECONDS = 5.0
     
     def __init__(self, service_name: str, port: int, config_manager):
         """
@@ -178,6 +183,22 @@ class BaseProxyService(ABC):
             print(f"[上游连接池] 已重建连接池: {reason}")
             asyncio.create_task(self._close_retired_client_later(old_client))
 
+    @staticmethod
+    def _body_requests_stream(body) -> bool:
+        """检测请求体是否声明 "stream": true。cc 2.1.185 起 accept 头变成 application/json，
+        流式标志只留在 body 里；只看请求头会把流式请求误判为非流式，导致
+        client.send(stream=False) 死等整个响应跑完(可达 80~170s)才返回、期间一字节都不
+        发给客户端，客户端约 60s 超时重发→错位。故必须据 body 判定。"""
+        if not body:
+            return False
+        try:
+            if b'"stream"' not in body:
+                return False
+            import re as _re
+            return _re.search(rb'"stream"\s*:\s*true', body) is not None
+        except Exception:
+            return False
+
     def _is_retryable_upstream_error(self, exc: Exception) -> bool:
         return isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError))
 
@@ -297,8 +318,10 @@ class BaseProxyService(ABC):
     ):
         """记录请求日志到jsonl文件（异步调度）"""
         try:
-            log_entry = await asyncio.to_thread(
-                self._build_log_entry,
+            # 同步构建（不再走 asyncio.to_thread）：高并发重试风暴下线程池会被占满，
+            # 大响应的 base64 编码在 to_thread 里永久排队，导致这些请求日志丢失
+            # （现象：jsonl 只剩小 body 的 429，200 大响应全部缺失）。
+            log_entry = self._build_log_entry(
                 method, path, status_code, duration_ms, target_headers,
                 filtered_body, original_headers, original_body, response_content,
                 channel, usage, response_truncated, total_response_bytes,
@@ -1462,7 +1485,11 @@ class BaseProxyService(ABC):
             'text/event-stream' in content_type or
             'stream' in content_type or
             'application/x-ndjson' in content_type or
-            "stream" in x_stainless_helper_method
+            "stream" in x_stainless_helper_method or
+            # cc 2.1.185 起 accept 头为 application/json、流式标志 "stream":true 只在 body：
+            # 仅看请求头会误判为非流式，client.send(stream=False) 死等整个响应、期间不给
+            # 客户端发字节 → 客户端约 60s 超时重发→错位。必须据 body 补判。
+            self._body_requests_stream(filtered_body)
         )
         upstream_attempts_log = []
 
@@ -1683,7 +1710,37 @@ class BaseProxyService(ABC):
                     while True:
                         stream_attempt_started = time.monotonic()
                         try:
-                            async for chunk in response.aiter_bytes():
+                            # 手动驱动上游字节迭代：流式下给每次读取设保活超时。anyrouter
+                            # 长 thinking 时 body 静默数十秒~数分钟，期间 clp 若一字节不发，
+                            # cc(尤其 2.1.185+ 字节级 idle 看门狗)会判卡死、提前放弃并重发，
+                            # 旧请求仍在后台跑完→"错位"。静默超阈值即向 cc 注入 SSE 注释保活帧；
+                            # 用 asyncio.wait 持有读取任务、超时不取消它，避免打断 httpx 流。
+                            byte_iter = response.aiter_bytes().__aiter__()
+                            pending_read = None
+                            while True:
+                                if pending_read is None:
+                                    pending_read = asyncio.ensure_future(byte_iter.__anext__())
+                                if is_stream:
+                                    done, _ = await asyncio.wait(
+                                        {pending_read}, timeout=self.SSE_KEEPALIVE_SECONDS
+                                    )
+                                    if not done:
+                                        if client_disconnected:
+                                            pending_read.cancel()
+                                            return
+                                        # 上游仍静默：发 SSE 注释行保活(冒号开头，客户端按
+                                        # 规范忽略内容，但收到字节即重置 idle 计时)。
+                                        yield b": keepalive\n\n"
+                                        continue
+                                else:
+                                    await asyncio.wait({pending_read})
+                                try:
+                                    chunk = pending_read.result()
+                                except StopAsyncIteration:
+                                    break
+                                finally:
+                                    pending_read = None
+
                                 # watcher 已探测到客户端断开 → 立即停止转发
                                 if client_disconnected:
                                     return

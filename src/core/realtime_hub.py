@@ -27,6 +27,7 @@ class RealTimeRequest:
     status_code: Optional[int] = None
     request_headers: Optional[Dict] = None
     response_chunks: Optional[List[str]] = None
+    response_chunks_total_len: int = 0
     response_truncated: bool = False
     target_url: Optional[str] = None
 
@@ -168,10 +169,13 @@ class RealTimeRequestHub:
 
             request = self.active_requests[request_id]
 
-            # 限制单个响应的总长度，避免内存爆炸
-            current_length = sum(len(c) for c in request.response_chunks)
-            if current_length < 2 * 1024 * 1024:  # 2MB限制
+            # 限制单个响应的总长度，避免内存爆炸。
+            # 用累加长度而非每次 sum(所有 chunk)：后者是 O(n)、整条流累积成 O(n²)，
+            # 且本方法在转发关键路径上(base_proxy 先 await 本方法、再 yield 给客户端)，
+            # 长响应到后期会越拖越慢，导致客户端 idle 超时、收不到完整响应而重试。
+            if request.response_chunks_total_len < 2 * 1024 * 1024:  # 2MB限制
                 request.response_chunks.append(chunk)
+                request.response_chunks_total_len += len(chunk)
             else:
                 if not request.response_truncated:
                     request.response_truncated = True
