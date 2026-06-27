@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.14.0] - 2026-06-27
+
+### Added
+
+- 组级上游兼容配置，用于适配 anyrouter 等对请求形态有特殊限制的中转。**三项均默认关闭，仅在组上显式开启时对该组生效，不影响其它组**：
+  - `force_thinking`：设为 `"adaptive"` 时，把该组 opus/sonnet 请求中 `thinking:{"type":"disabled"}` 或缺失的 thinking 改写为 `{"type":"adaptive"}`，haiku 改写为 `{"type":"enabled","budget_tokens":1024}`。修复部分中转拒绝 `thinking:disabled` 的 opus 请求（表现为 `429 Service Unavailable`）导致 subagent / WebFetch 等"关思考的子请求"不可用的问题。
+  - `web_tool_choice_fix`：设为 `true` 时，移除带 `web_search`/`web_fetch` 服务端工具的请求中的强制 `tool_choice`（`{"type":"tool",...}`），退回 auto。修复部分中转拒绝"强制调用服务端工具"导致 WebSearch 不可用的问题（实测同一上游：cc 2.1.185 用强制 tool_choice 调 web_search → 429，cc 2.1.154 用 auto → 200）。
+  - `strip_beta`：字符串数组，从该组请求的 `anthropic-beta` 头中移除指定 beta 标志，用于剥离上游不识别的新 beta。
+
 ## [1.13.5] - 2026-06-08
 
 ### Added

@@ -926,6 +926,113 @@ class BaseProxyService(ABC):
             
         return body, None
 
+    def _apply_thinking_override(self, body: bytes, group_data: Dict[str, Any]) -> bytes:
+        """按组覆写请求体的 thinking 参数。
+
+        背景: anyrouter 等逆向中转拒绝 opus 的 "thinking: disabled" 请求并把拒绝包装成
+        429 Service Unavailable (实测 adaptive 成功率 3/3、disabled 成功率 0/109)。cc 的
+        subagent、websearch/webfetch 辅助请求为了快会关思考(disabled)，因而全被挡。开启
+        本覆写后把这类请求的 thinking 规范化为模型支持的 on-mode，骗过中转校验。
+
+        仅当组配置 "force_thinking" 为真值时生效，按模型选择:
+          - opus / sonnet -> {"type": "adaptive"}                    (4.x 唯一 on-mode)
+          - haiku         -> {"type": "enabled", budget_tokens:1024} (haiku 不支持 adaptive)
+        已是 adaptive 的不动；非 Anthropic 模型 / 解析失败时原样返回。
+        """
+        if not body or not isinstance(group_data, dict):
+            return body
+        if not group_data.get('force_thinking'):
+            return body
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return body
+        if not isinstance(data, dict):
+            return body
+
+        model = str(data.get('model') or '').lower()
+        if not model:
+            return body
+
+        th = data.get('thinking')
+        if isinstance(th, dict) and th.get('type') == 'adaptive':
+            return body  # 已是 adaptive，无需改
+
+        if 'haiku' in model:
+            # haiku 只支持固定预算思考，budget 必须 >=1024 且 < max_tokens
+            max_tokens = data.get('max_tokens')
+            if isinstance(max_tokens, int) and max_tokens <= 1024:
+                return body  # 放不下最小思考预算，不动
+            data['thinking'] = {'type': 'enabled', 'budget_tokens': 1024}
+        elif 'opus' in model or 'sonnet' in model or 'claude' in model:
+            data['thinking'] = {'type': 'adaptive'}
+        else:
+            return body  # 非 Anthropic 模型不碰
+
+        try:
+            return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        except (TypeError, ValueError):
+            return body
+
+    @staticmethod
+    def _strip_beta_flags(headers: Dict[str, str], strip_list) -> None:
+        """从 anthropic-beta 头里移除指定 beta 标志(就地修改 headers)。
+
+        anyrouter 后端较旧，在 web_search 服务端工具场景下遇到较新的 beta(实测
+        thinking-token-count-2026-05-13)会返回 429;cc 2.1.154 不带该 beta 时同样的
+        web_search 请求 200。剥掉上游不认识的新 beta，新版 cc 也能用 WebSearch。
+        仅当组配置 "strip_beta" 非空时生效。
+        """
+        if not strip_list:
+            return
+        strip_set = {str(s).strip() for s in strip_list if str(s).strip()}
+        if not strip_set:
+            return
+        for key in list(headers.keys()):
+            if key.lower() == 'anthropic-beta':
+                flags = [f.strip() for f in headers[key].split(',')]
+                headers[key] = ','.join(f for f in flags if f and f not in strip_set)
+                break
+
+    def _relax_web_tool_choice(self, body: bytes, group_data: Dict[str, Any]) -> bytes:
+        """移除带服务端 web 工具请求的强制 tool_choice。
+
+        实测同一上游(anyrouter): cc 2.1.185 的 WebSearch 子请求带
+        tool_choice={"type":"tool","name":"web_search"} 强制调用服务端工具 -> 429;
+        cc 2.1.154 不带 tool_choice(auto)的同形请求 -> 200。anyrouter 拒绝"强制调用
+        服务端 web 工具"。移除强制 tool_choice(退回 auto)让新版 cc 也能用 WebSearch。
+        仅当组配置 web_tool_choice_fix 为真、且请求确实带 web_search/web_fetch 工具时生效。
+        """
+        if not body or not isinstance(group_data, dict):
+            return body
+        if not group_data.get('web_tool_choice_fix'):
+            return body
+        if b'web_search' not in body and b'web_fetch' not in body:
+            return body
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return body
+        if not isinstance(data, dict):
+            return body
+        tc = data.get('tool_choice')
+        if not (isinstance(tc, dict) and tc.get('type') == 'tool'):
+            return body
+        tools = data.get('tools')
+        if not isinstance(tools, list):
+            return body
+        has_server_web = any(
+            isinstance(t, dict) and str(t.get('type', '')).startswith(('web_search', 'web_fetch'))
+            for t in tools
+        )
+        if not has_server_web:
+            return body
+        data.pop('tool_choice', None)
+        try:
+            return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        except (TypeError, ValueError):
+            return body
+
     # modality 优先级：图片 > 音频 > 文档（命中第一个即用）
     _MODALITY_PRIORITY = ('image', 'audio', 'document')
 
@@ -1384,6 +1491,11 @@ class BaseProxyService(ABC):
 
         key_name = key_data.get('name', group_name)
 
+        # 按组覆写 thinking 参数（针对 anyrouter 等只接受带 thinking 的中转）
+        modified_body = self._apply_thinking_override(modified_body, group_data)
+        # 按组移除强制 tool_choice（anyrouter 拒绝强制调用服务端 web 工具）
+        modified_body = self._relax_web_tool_choice(modified_body, group_data)
+
         # 构建目标URL
         base_url = group_data['base_url'].rstrip('/')
         normalized_path = path.lstrip('/')
@@ -1410,6 +1522,11 @@ class BaseProxyService(ABC):
             headers['originator'] = 'codex_cli_rs'
             if key_data.get('account_id'):
                 headers['chatgpt-account-id'] = key_data['account_id']
+
+        # 按组剥离上游不兼容的 anthropic-beta 标志(如 anyrouter 在 web_search 下拒绝新 beta)
+        strip_beta = group_data.get('strip_beta')
+        if strip_beta:
+            self._strip_beta_flags(headers, strip_beta)
 
         return target_url, headers, modified_body, key_name, group_name
 

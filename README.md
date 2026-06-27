@@ -257,6 +257,35 @@ docker-compose up -d --build
 | `~/.clp/run/` | 运行时文件（PID、日志） |
 | `~/.clp/data/` | 数据文件（请求日志、统计） |
 
+## 上游兼容配置（可选）
+
+部分逆向中转（如 anyrouter）对请求形态有特殊限制，会导致新版 Claude Code 的 subagent / WebSearch 等功能报 `429 Service Unavailable`。可在 `~/.clp/claude.json` 的对应组上按需开启以下字段（**均默认关闭，仅对该组生效，不影响其它组**）：
+
+| 字段 | 取值 | 作用 |
+|------|------|------|
+| `force_thinking` | `"adaptive"` | 把该组 opus/sonnet 请求中 `thinking:disabled` 或缺失的 thinking 改写为 `adaptive`（haiku 改为 `budget_tokens:1024`）。修复中转拒绝 `thinking:disabled` 的 opus 请求，导致 subagent / WebFetch 等"关思考的子请求"不可用。 |
+| `web_tool_choice_fix` | `true` | 移除带 `web_search`/`web_fetch` 服务端工具请求中的强制 `tool_choice`，退回 auto。修复中转拒绝"强制调用服务端工具"，导致 WebSearch 不可用。 |
+| `strip_beta` | 字符串数组 | 从该组请求的 `anthropic-beta` 头移除指定 beta 标志，剥离上游不识别的新 beta。 |
+
+示例（`~/.clp/claude.json`）：
+
+```json
+{
+  "__groups": {
+    "AnyRouter": {
+      "base_url": "https://anyrouter.top",
+      "auth_type": "auth_token",
+      "force_thinking": "adaptive",
+      "web_tool_choice_fix": true,
+      "strip_beta": ["thinking-token-count-2026-05-13"],
+      "keys": [
+        { "name": "key1", "auth_token": "sk-xxx", "disabled": false }
+      ]
+    }
+  }
+}
+```
+
 ## 项目结构
 
 ```
