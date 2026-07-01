@@ -63,8 +63,14 @@ def start_daemon(port=DEFAULT_PORT):
                 'src.ui.ui_server:app'
             ]
 
+        # 固定工作目录到包根目录(含 src 的目录)。否则 waitress/gunicorn 以 -m 方式启动时
+        # 会把「当前工作目录」注入 sys.path[0]；当用户在一个自带同名 src/ 包的项目目录下
+        # 执行 clp start 时，import src.ui 会命中那个无关的 src 而报 No module named 'src.ui'。
+        # 与 claude/codex 的启动逻辑保持一致(均显式传 cwd=项目根)。
+        project_root = Path(__file__).resolve().parent.parent.parent
+
         with open(LOG_FILE, 'a') as log:
-            proc = create_detached_process(cmd, log)
+            proc = create_detached_process(cmd, log, cwd=str(project_root))
             
             # 写PID文件
             with open(PID_FILE, 'w') as f:
