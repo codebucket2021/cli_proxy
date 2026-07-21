@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.15.0] - 2026-07-21
+
+### Added
+
+- 组级上游兼容配置新增 `tools_pad`（默认关闭，仅在组上显式开启时生效）：给客户端工具数不足 8 个的请求补足 Claude Code 真实工具名的极简假工具（~1.3KB，空 schema + "不可调用"描述），并在原请求完全无工具且未指定 `tool_choice` 时追加 `tool_choice:{"type":"none"}` 防止模型误调。适配 anyrouter 2026-07-21 起收紧的请求指纹校验——要求 thinking 开启（配合 `force_thinking`）**且**带足量真名客户端工具 schema，否则 429 Service Unavailable，导致 WebFetch / WebSearch / 标题生成等辅助请求全挂（实测：失败体 + adaptive + 7 个真名工具 → 200，3 个 → 429，改名 → 429，schema 内容不校验）。
+
 ## [1.14.0] - 2026-06-27
 
 ### Added

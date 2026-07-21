@@ -1033,6 +1033,69 @@ class BaseProxyService(ABC):
         except (TypeError, ValueError):
             return body
 
+    # anyrouter 2026-07 起按"客户端工具名列表"做请求指纹校验，识别的是 Claude Code
+    # 的真实工具名(改名即 429)，schema 内容不校验(空 schema + 假描述可过)，因此
+    # 用极简假体(~1.3KB)冒充即可。3 个名字不够、7 个够，留 8 个作余量。
+    _PAD_TOOL_NAMES = ('Agent', 'AskUserQuestion', 'Bash', 'Edit',
+                       'Glob', 'Grep', 'Read', 'Write')
+    _PAD_TOOL_MIN_COUNT = 8
+
+    def _pad_client_tools(self, body: bytes, group_data: Dict[str, Any]) -> bytes:
+        """给工具表过小的请求补足 Claude Code 客户端工具名，骗过中转指纹校验。
+
+        背景: anyrouter 2026-07-21 起收紧准入，要求请求"像 CC 主会话"——thinking 开启
+        (由 force_thinking 负责) 且带足量【真名】客户端工具 schema，缺一即
+        429 Service Unavailable。cc 的辅助请求(WebFetch 摘要/标题生成/WebSearch 子
+        请求)工具表为空或只有服务端 web_search，因而全被拒。实测(直发对照):
+          - 失败体 + adaptive + 7 个真名工具 -> 200；3 个 -> 429；改名的 7 个 -> 429
+          - schema 换成空对象 + "不可用"描述 -> 仍 200 (校验只认名字)
+          - 消息填充 90KB / 换模型 / 剥 beta 均无效 (非体积、非模型、非 beta 问题)
+
+        仅当组配置 "tools_pad" 为真值时生效。工具数 >= _PAD_TOOL_MIN_COUNT 的请求
+        (主会话/subagent)不动。填充工具描述明确"不可调用"；若原请求本无任何工具
+        且未指定 tool_choice，额外设 tool_choice:{"type":"none"} 保证模型绝不误调
+        (实测 anyrouter 接受 none)。非 Anthropic 模型 / 解析失败时原样返回。
+        """
+        if not body or not isinstance(group_data, dict):
+            return body
+        if not group_data.get('tools_pad'):
+            return body
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return body
+        if not isinstance(data, dict):
+            return body
+        if 'claude' not in str(data.get('model') or '').lower():
+            return body
+
+        tools = data.get('tools')
+        if not isinstance(tools, list):
+            tools = []
+        if len(tools) >= self._PAD_TOOL_MIN_COUNT:
+            return body
+
+        existing_names = {t.get('name') for t in tools if isinstance(t, dict)}
+        pad = [
+            {
+                'name': name,
+                'description': 'Not available in this session. Never invoke this tool.',
+                'input_schema': {'type': 'object', 'properties': {}, 'required': []},
+            }
+            for name in self._PAD_TOOL_NAMES if name not in existing_names
+        ]
+        if not pad:
+            return body
+
+        had_no_tools = not tools
+        data['tools'] = tools + pad
+        if had_no_tools and 'tool_choice' not in data:
+            data['tool_choice'] = {'type': 'none'}
+        try:
+            return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        except (TypeError, ValueError):
+            return body
+
     # modality 优先级：图片 > 音频 > 文档（命中第一个即用）
     _MODALITY_PRIORITY = ('image', 'audio', 'document')
 
@@ -1495,6 +1558,8 @@ class BaseProxyService(ABC):
         modified_body = self._apply_thinking_override(modified_body, group_data)
         # 按组移除强制 tool_choice（anyrouter 拒绝强制调用服务端 web 工具）
         modified_body = self._relax_web_tool_choice(modified_body, group_data)
+        # 按组补足客户端工具名（anyrouter 按工具名指纹拒绝工具表过小的请求）
+        modified_body = self._pad_client_tools(modified_body, group_data)
 
         # 构建目标URL
         base_url = group_data['base_url'].rstrip('/')

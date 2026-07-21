@@ -266,6 +266,7 @@ docker-compose up -d --build
 | `force_thinking` | `"adaptive"` | 把该组 opus/sonnet 请求中 `thinking:disabled` 或缺失的 thinking 改写为 `adaptive`（haiku 改为 `budget_tokens:1024`）。修复中转拒绝 `thinking:disabled` 的 opus 请求，导致 subagent / WebFetch 等"关思考的子请求"不可用。 |
 | `web_tool_choice_fix` | `true` | 移除带 `web_search`/`web_fetch` 服务端工具请求中的强制 `tool_choice`，退回 auto。修复中转拒绝"强制调用服务端工具"，导致 WebSearch 不可用。 |
 | `strip_beta` | 字符串数组 | 从该组请求的 `anthropic-beta` 头移除指定 beta 标志，剥离上游不识别的新 beta。 |
+| `tools_pad` | `true` | 给客户端工具数不足 8 个的请求补足 Claude Code 真名极简假工具（模型不会调用）。修复中转按"工具名指纹"拒绝工具表过小的请求（需配合 `force_thinking` 使用），导致 WebFetch / WebSearch / 标题生成等辅助请求不可用。 |
 
 示例（`~/.clp/claude.json`）：
 
